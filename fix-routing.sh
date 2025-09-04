@@ -1,7 +1,7 @@
 #!/bin/bash
 
-# Fix Sing-Box VPN Routing and Firewall Configuration
-# This script properly configures the system for VPN traffic routing
+# Complete Sing-Box VPN Routing Fix
+# This script fixes all routing issues for proper VPN operation
 
 set -e
 
@@ -33,303 +33,467 @@ if [[ $EUID -ne 0 ]]; then
     exit 1
 fi
 
-print_status "Fixing VPN routing and firewall configuration..."
+print_status "Starting complete VPN routing fix..."
 
-# 1. Enable IP forwarding permanently
-print_status "Enabling IP forwarding..."
+# 1. Stop everything first
+print_status "Stopping existing services..."
+systemctl stop singbox-vpn 2>/dev/null || true
+pkill -f sing-box 2>/dev/null || true
+sleep 2
+
+# 2. Fix system networking settings
+print_status "Configuring system networking..."
+
+# Enable IP forwarding
 cat > /etc/sysctl.d/99-sing-box.conf << EOF
 # Sing-Box VPN Settings
 net.ipv4.ip_forward = 1
 net.ipv6.conf.all.forwarding = 1
-net.ipv4.conf.all.rp_filter = 2
-net.ipv4.conf.default.rp_filter = 2
+net.ipv4.conf.all.rp_filter = 0
+net.ipv4.conf.default.rp_filter = 0
+net.ipv4.conf.all.accept_source_route = 1
+net.ipv4.conf.default.accept_source_route = 1
 
-# Performance tuning
+# Performance
 net.core.default_qdisc = fq
 net.ipv4.tcp_congestion = bbr
 net.ipv4.tcp_fastopen = 3
+net.core.netdev_max_backlog = 5000
+net.ipv4.tcp_mem = 786432 1048576 26777216
+net.ipv4.tcp_rmem = 4096 87380 33554432
+net.ipv4.tcp_wmem = 4096 65536 33554432
 
-# Security
-net.ipv4.conf.all.send_redirects = 0
-net.ipv4.conf.default.send_redirects = 0
-net.ipv4.conf.all.accept_redirects = 0
-net.ipv4.conf.default.accept_redirects = 0
+# DNS
+net.ipv4.tcp_keepalive_time = 60
+net.ipv4.tcp_keepalive_intvl = 10
+net.ipv4.tcp_keepalive_probes = 6
 EOF
 
-sysctl -p /etc/sysctl.d/99-sing-box.conf > /dev/null 2>&1
-print_success "IP forwarding enabled"
+sysctl -p /etc/sysctl.d/99-sing-box.conf
 
-# 2. Install required packages
-print_status "Installing required packages..."
-apt-get update -qq
-apt-get install -y -qq \
-    iptables \
-    iptables-persistent \
-    net-tools \
-    dnsutils \
-    curl \
-    wget \
-    ca-certificates
+print_success "System networking configured"
 
-print_success "Packages installed"
+# 3. Clean and setup iptables
+print_status "Setting up firewall rules..."
 
-# 3. Configure UFW if installed
-if command -v ufw &> /dev/null; then
-    print_status "Configuring UFW firewall..."
-    
-    # Allow forwarding in UFW
-    sed -i 's/DEFAULT_FORWARD_POLICY="DROP"/DEFAULT_FORWARD_POLICY="ACCEPT"/' /etc/default/ufw
-    
-    # Enable UFW routing
-    cat >> /etc/ufw/sysctl.conf << EOF
-
-# Sing-Box VPN
-net.ipv4.ip_forward=1
-net.ipv6.conf.all.forwarding=1
-EOF
-    
-    # Add UFW before rules for NAT
-    cat > /etc/ufw/before.rules.sing-box << 'EOF'
-# NAT table rules for Sing-Box VPN
-*nat
-:POSTROUTING ACCEPT [0:0]
-
-# Allow traffic from TUN to be masqueraded
--A POSTROUTING -o tun0 -j MASQUERADE
--A POSTROUTING -o tun+ -j MASQUERADE
--A POSTROUTING -s 172.19.0.0/30 -j MASQUERADE
-
-COMMIT
-
-# Filter rules
-*filter
-:ufw-before-input - [0:0]
-:ufw-before-output - [0:0]
-:ufw-before-forward - [0:0]
-
-# Allow TUN traffic
--A ufw-before-forward -i tun0 -j ACCEPT
--A ufw-before-forward -o tun0 -j ACCEPT
--A ufw-before-forward -i tun+ -j ACCEPT
--A ufw-before-forward -o tun+ -j ACCEPT
-
-COMMIT
-EOF
-    
-    # Backup original and add our rules
-    if [ -f /etc/ufw/before.rules ]; then
-        cp /etc/ufw/before.rules /etc/ufw/before.rules.backup
-        cat /etc/ufw/before.rules.sing-box > /tmp/ufw.tmp
-        cat /etc/ufw/before.rules >> /tmp/ufw.tmp
-        mv /tmp/ufw.tmp /etc/ufw/before.rules
-    fi
-    
-    # Allow necessary ports
-    ufw allow 8080/tcp comment 'Sing-Box Web UI' > /dev/null 2>&1 || true
-    ufw allow 22/tcp comment 'SSH' > /dev/null 2>&1 || true
-    
-    # Reload UFW
-    ufw --force disable > /dev/null 2>&1
-    ufw --force enable > /dev/null 2>&1
-    
-    print_success "UFW configured for VPN routing"
-else
-    print_warning "UFW not installed, skipping UFW configuration"
-fi
-
-# 4. Configure iptables directly
-print_status "Configuring iptables rules..."
-
-# Clear existing rules
+# Clean existing rules
 iptables -t nat -F
 iptables -t mangle -F
-iptables -F FORWARD
+iptables -t filter -F
+iptables -X
 
-# Enable NAT for VPN
-iptables -t nat -A POSTROUTING -o tun0 -j MASQUERADE
-iptables -t nat -A POSTROUTING -o tun+ -j MASQUERADE
+# Set default policies
+iptables -P INPUT ACCEPT
+iptables -P FORWARD ACCEPT
+iptables -P OUTPUT ACCEPT
+
+# Enable NAT for all possible TUN interfaces
+for tun in tun0 tun1 utun singbox0; do
+    iptables -t nat -A POSTROUTING -o $tun -j MASQUERADE 2>/dev/null || true
+done
+
+# Enable NAT for the subnet
 iptables -t nat -A POSTROUTING -s 172.19.0.0/30 -j MASQUERADE
+iptables -t nat -A POSTROUTING -s 198.18.0.0/15 -j MASQUERADE
 
 # Allow forwarding
-iptables -A FORWARD -i tun0 -j ACCEPT
-iptables -A FORWARD -o tun0 -j ACCEPT
-iptables -A FORWARD -i tun+ -j ACCEPT
-iptables -A FORWARD -o tun+ -j ACCEPT
-iptables -A FORWARD -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+iptables -A FORWARD -j ACCEPT
+iptables -A INPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
+iptables -A OUTPUT -j ACCEPT
 
-# Fix MTU issues
+# Fix MSS clamping for PPPoE/tunnels
 iptables -t mangle -A FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
 
-# Save iptables rules
+# Save rules
 if command -v netfilter-persistent &> /dev/null; then
-    netfilter-persistent save > /dev/null 2>&1
+    netfilter-persistent save
 elif command -v iptables-save &> /dev/null; then
     mkdir -p /etc/iptables
     iptables-save > /etc/iptables/rules.v4
 fi
 
-print_success "Iptables rules configured"
+print_success "Firewall rules configured"
 
-# 5. Create routing script for Sing-Box
-print_status "Creating routing helper script..."
+# 4. Fix UFW if present
+if command -v ufw &> /dev/null; then
+    print_status "Fixing UFW..."
+    
+    # Backup UFW config
+    cp /etc/default/ufw /etc/default/ufw.backup 2>/dev/null || true
+    
+    # Enable forwarding in UFW
+    sed -i 's/DEFAULT_FORWARD_POLICY="DROP"/DEFAULT_FORWARD_POLICY="ACCEPT"/' /etc/default/ufw
+    
+    # Add rules before UFW loads
+    cat > /etc/ufw/before.rules.new << 'EOF'
+# NAT table rules
+*nat
+:POSTROUTING ACCEPT [0:0]
+-A POSTROUTING -s 172.19.0.0/30 -j MASQUERADE
+-A POSTROUTING -o tun0 -j MASQUERADE
+-A POSTROUTING -o tun+ -j MASQUERADE
+COMMIT
 
-cat > /usr/local/bin/sing-box-routing << 'EOF'
+# Allow forwarding for TUN
+*filter
+:ufw-before-input - [0:0]
+:ufw-before-output - [0:0]
+:ufw-before-forward - [0:0]
+-A ufw-before-forward -j ACCEPT
+COMMIT
+EOF
+    
+    # Prepend to existing rules
+    if [ -f /etc/ufw/before.rules ]; then
+        cp /etc/ufw/before.rules /etc/ufw/before.rules.backup
+        cat /etc/ufw/before.rules.new /etc/ufw/before.rules.backup > /etc/ufw/before.rules
+    fi
+    
+    # Reload UFW
+    ufw --force disable
+    ufw --force enable
+    
+    print_success "UFW fixed"
+fi
+
+# 5. Download and update GeoIP databases
+print_status "Downloading GeoIP databases..."
+
+mkdir -p /usr/share/sing-box
+
+# Download with error handling
+download_file() {
+    local url=$1
+    local output=$2
+    local name=$3
+    
+    if wget -q --timeout=10 --tries=2 -O "$output" "$url"; then
+        print_success "$name downloaded"
+    else
+        print_warning "Failed to download $name (not critical)"
+    fi
+}
+
+download_file \
+    "https://github.com/SagerNet/sing-geoip/releases/latest/download/geoip.db" \
+    "/usr/share/sing-box/geoip.db" \
+    "GeoIP database"
+
+download_file \
+    "https://github.com/SagerNet/sing-geosite/releases/latest/download/geosite.db" \
+    "/usr/share/sing-box/geosite.db" \
+    "GeoSite database"
+
+# 6. Create test configuration
+print_status "Creating test configuration..."
+
+cat > /etc/singbox-vpn/test-direct.json << 'EOF'
+{
+  "log": {
+    "level": "debug",
+    "timestamp": true
+  },
+  "dns": {
+    "servers": [
+      {
+        "tag": "google",
+        "address": "8.8.8.8"
+      }
+    ],
+    "strategy": "prefer_ipv4"
+  },
+  "inbounds": [
+    {
+      "type": "tun",
+      "tag": "tun-in",
+      "interface_name": "tun0",
+      "inet4_address": "172.19.0.1/30",
+      "mtu": 9000,
+      "auto_route": true,
+      "strict_route": false,
+      "stack": "system"
+    }
+  ],
+  "outbounds": [
+    {
+      "type": "direct",
+      "tag": "direct"
+    }
+  ],
+  "route": {
+    "auto_detect_interface": true
+  }
+}
+EOF
+
+# 7. Create advanced routing script
+print_status "Creating advanced routing script..."
+
+cat > /usr/local/bin/fix-vpn-routing << 'EOF'
 #!/bin/bash
-# Sing-Box routing helper script
+
+# Advanced VPN Routing Fixer
 
 case "$1" in
-    up)
-        # Enable routing when VPN starts
-        sysctl -w net.ipv4.ip_forward=1 > /dev/null
-        sysctl -w net.ipv6.conf.all.forwarding=1 > /dev/null
+    check)
+        echo "=== Checking VPN Routing ==="
         
-        # Setup NAT
-        iptables -t nat -C POSTROUTING -o tun0 -j MASQUERADE 2>/dev/null || \
+        # Check IP forwarding
+        echo -n "IP Forwarding: "
+        if [ "$(cat /proc/sys/net/ipv4/ip_forward)" = "1" ]; then
+            echo "✓ Enabled"
+        else
+            echo "✗ Disabled - Fixing..."
+            sysctl -w net.ipv4.ip_forward=1
+        fi
+        
+        # Check TUN interface
+        echo -n "TUN Interface: "
+        if ip link show tun0 &>/dev/null; then
+            echo "✓ Active"
+            ip addr show tun0
+        else
+            echo "✗ Not found"
+        fi
+        
+        # Check NAT rules
+        echo -n "NAT Rules: "
+        if iptables -t nat -L POSTROUTING -n | grep -q MASQUERADE; then
+            echo "✓ Present"
+        else
+            echo "✗ Missing - Fixing..."
             iptables -t nat -A POSTROUTING -o tun0 -j MASQUERADE
+        fi
         
-        # Allow forwarding
-        iptables -C FORWARD -i tun0 -j ACCEPT 2>/dev/null || \
-            iptables -A FORWARD -i tun0 -j ACCEPT
-        iptables -C FORWARD -o tun0 -j ACCEPT 2>/dev/null || \
-            iptables -A FORWARD -o tun0 -j ACCEPT
+        # Check default route
+        echo "Default Route:"
+        ip route | grep default
         
-        echo "VPN routing enabled"
+        # Check DNS
+        echo "DNS Servers:"
+        cat /etc/resolv.conf | grep nameserver
         ;;
-    
-    down)
-        # Clean up when VPN stops
-        iptables -t nat -D POSTROUTING -o tun0 -j MASQUERADE 2>/dev/null || true
-        iptables -D FORWARD -i tun0 -j ACCEPT 2>/dev/null || true
-        iptables -D FORWARD -o tun0 -j ACCEPT 2>/dev/null || true
         
-        echo "VPN routing disabled"
+    fix)
+        echo "Applying comprehensive routing fix..."
+        
+        # Enable forwarding
+        sysctl -w net.ipv4.ip_forward=1
+        sysctl -w net.ipv6.conf.all.forwarding=1
+        
+        # Clear and set iptables
+        iptables -t nat -F
+        iptables -t nat -A POSTROUTING -o tun0 -j MASQUERADE
+        iptables -t nat -A POSTROUTING -s 172.19.0.0/30 -j MASQUERADE
+        
+        iptables -F FORWARD
+        iptables -A FORWARD -j ACCEPT
+        
+        # Add route if TUN exists
+        if ip link show tun0 &>/dev/null; then
+            # Get default gateway
+            GW=$(ip route | grep default | awk '{print $3}')
+            DEV=$(ip route | grep default | awk '{print $5}')
+            
+            # Add specific routes for VPN server (prevents routing loop)
+            # You'll need to add your VPN server IP here
+            # ip route add YOUR_VPN_SERVER_IP via $GW dev $DEV
+            
+            # Force all traffic through TUN
+            ip route add default dev tun0 metric 1 2>/dev/null || true
+        fi
+        
+        echo "Routing fix applied!"
         ;;
-    
-    status)
-        echo "=== Routing Status ==="
-        echo "IP Forward: $(cat /proc/sys/net/ipv4/ip_forward)"
-        echo ""
-        echo "=== NAT Rules ==="
-        iptables -t nat -L POSTROUTING -n -v | grep tun
-        echo ""
-        echo "=== TUN Interfaces ==="
-        ip addr show | grep -E "tun[0-9]|singbox"
+        
+    test)
+        echo "Testing connectivity..."
+        
+        # Test local network
+        echo -n "Local network: "
+        if ping -c 1 -W 2 8.8.8.8 &>/dev/null; then
+            echo "✓ OK"
+        else
+            echo "✗ Failed"
+        fi
+        
+        # Test DNS
+        echo -n "DNS resolution: "
+        if nslookup google.com &>/dev/null; then
+            echo "✓ OK"
+        else
+            echo "✗ Failed"
+        fi
+        
+        # Test HTTP
+        echo -n "HTTP connection: "
+        if curl -s --max-time 5 http://www.google.com &>/dev/null; then
+            echo "✓ OK"
+        else
+            echo "✗ Failed"
+        fi
+        
+        # Show current IP
+        echo "Current public IP:"
+        curl -s --max-time 5 ifconfig.io || echo "Failed to get IP"
         ;;
-    
+        
     *)
-        echo "Usage: $0 {up|down|status}"
+        echo "Usage: $0 {check|fix|test}"
         exit 1
         ;;
 esac
 EOF
 
-chmod +x /usr/local/bin/sing-box-routing
-print_success "Routing helper script created"
+chmod +x /usr/local/bin/fix-vpn-routing
 
-# 6. Download and setup GeoIP/GeoSite databases
-print_status "Downloading GeoIP and GeoSite databases..."
+print_success "Advanced routing script created"
 
-mkdir -p /usr/share/sing-box
+# 8. Create working Sing-Box runner
+print_status "Creating Sing-Box runner script..."
 
-# Download databases with progress
-wget -q --show-progress \
-    "https://github.com/SagerNet/sing-geoip/releases/latest/download/geoip.db" \
-    -O /usr/share/sing-box/geoip.db
+cat > /usr/local/bin/run-sing-box << 'EOF'
+#!/bin/bash
 
-wget -q --show-progress \
-    "https://github.com/SagerNet/sing-geosite/releases/latest/download/geosite.db" \
-    -O /usr/share/sing-box/geosite.db
+CONFIG_FILE="${1:-/etc/singbox-vpn/config.json}"
 
-# Also download Iran-specific geoip
-wget -q --show-progress \
-    "https://github.com/chocolate4u/Iran-sing-box-rules/releases/latest/download/geoip.db" \
-    -O /usr/share/sing-box/geoip-iran.db 2>/dev/null || true
+# Pre-flight checks
+echo "Starting Sing-Box VPN..."
 
-print_success "GeoIP databases downloaded"
+# Ensure routing is ready
+sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1
+iptables -t nat -C POSTROUTING -o tun0 -j MASQUERADE 2>/dev/null || \
+    iptables -t nat -A POSTROUTING -o tun0 -j MASQUERADE
 
-# 7. Fix DNS resolution
-print_status "Configuring DNS..."
+# Kill any existing sing-box
+pkill -f sing-box 2>/dev/null || true
+sleep 1
 
-# Ensure systemd-resolved doesn't interfere
-if systemctl is-active systemd-resolved > /dev/null 2>&1; then
-    # Configure systemd-resolved to work with VPN
+# Start sing-box with proper permissions
+exec /usr/local/bin/sing-box run -c "$CONFIG_FILE"
+EOF
+
+chmod +x /usr/local/bin/run-sing-box
+
+# 9. Fix DNS resolution
+print_status "Fixing DNS resolution..."
+
+# Disable systemd-resolved if it's interfering
+if systemctl is-active systemd-resolved >/dev/null 2>&1; then
+    print_warning "Configuring systemd-resolved..."
+    
     mkdir -p /etc/systemd/resolved.conf.d/
     cat > /etc/systemd/resolved.conf.d/sing-box.conf << EOF
 [Resolve]
 DNS=8.8.8.8 1.1.1.1
-FallbackDNS=8.8.4.4 1.0.0.1
-DNSOverTLS=opportunistic
+FallbackDNS=8.8.4.4
+Domains=~.
+DNSOverTLS=no
 Cache=yes
 DNSStubListener=no
 EOF
     
     systemctl restart systemd-resolved
+    
+    # Link resolv.conf properly
+    rm -f /etc/resolv.conf
+    ln -sf /run/systemd/resolve/resolv.conf /etc/resolv.conf 2>/dev/null || \
+        echo -e "nameserver 8.8.8.8\nnameserver 1.1.1.1" > /etc/resolv.conf
+fi
+
+# Ensure we have working DNS
+if ! grep -q "8.8.8.8\|1.1.1.1" /etc/resolv.conf; then
+    cp /etc/resolv.conf /etc/resolv.conf.backup
+    echo -e "nameserver 8.8.8.8\nnameserver 1.1.1.1" > /etc/resolv.conf
 fi
 
 print_success "DNS configured"
 
-# 8. Update Sing-Box backend with fixed version
-print_status "Updating Sing-Box backend..."
-
-if [ -f /etc/singbox-vpn/backend.py ]; then
-    # Backup old backend
-    cp /etc/singbox-vpn/backend.py /etc/singbox-vpn/backend.py.backup
-    
-    # Download or copy the fixed backend
-    # (The fixed backend from the previous artifact should be copied here)
-    print_warning "Please replace /etc/singbox-vpn/backend.py with the fixed version"
-fi
-
-# 9. Restart services
-print_status "Restarting services..."
-
-systemctl restart singbox-vpn > /dev/null 2>&1 || true
-
-print_success "Services restarted"
-
-# 10. Test connectivity
-print_status "Testing configuration..."
-
-# Check if TUN interface will be created
-if [ -f /etc/singbox-vpn/config.json ]; then
-    print_success "Sing-Box config found"
-else
-    print_warning "No Sing-Box config found. Import a server first."
-fi
+# 10. Test basic connectivity
+print_status "Testing basic connectivity..."
 
 # Test DNS
-if nslookup google.com > /dev/null 2>&1; then
+if nslookup google.com >/dev/null 2>&1; then
     print_success "DNS resolution working"
 else
-    print_warning "DNS resolution might have issues"
+    print_warning "DNS resolution may have issues"
 fi
 
-# Show current network interfaces
-echo ""
-echo "=== Current Network Interfaces ==="
-ip -brief addr show
+# Test internet
+if ping -c 1 -W 2 8.8.8.8 >/dev/null 2>&1; then
+    print_success "Internet connectivity OK"
+else
+    print_warning "Internet connectivity issues detected"
+fi
 
-echo ""
-echo "=== Routing Table ==="
-ip route show | head -5
+# 11. Restart service with proper config
+print_status "Restarting VPN service..."
 
+# Make sure we have a valid config
+if [ ! -f /etc/singbox-vpn/config.json ]; then
+    print_warning "No config.json found. You need to import a server first."
+else
+    # Try to start the service
+    systemctl restart singbox-vpn 2>/dev/null || true
+    sleep 3
+    
+    if systemctl is-active singbox-vpn >/dev/null 2>&1; then
+        print_success "VPN service started"
+    else
+        print_warning "VPN service not running. Start it manually after importing a server."
+    fi
+fi
+
+# 12. Show diagnostic info
 echo ""
-print_success "VPN routing and firewall configuration complete!"
+echo "========================================"
+echo "         DIAGNOSTIC INFORMATION"
+echo "========================================"
 echo ""
-echo -e "${YELLOW}Important for Iran users:${NC}"
-echo "1. The system is now configured to route traffic through VPN"
-echo "2. GeoIP databases for Iran have been installed"
-echo "3. Local Iranian sites will bypass the VPN automatically"
-echo "4. YouTube and other blocked sites will go through VPN"
+
+# Show network interfaces
+echo "Network Interfaces:"
+ip -brief addr show | grep -E "tun|UP"
 echo ""
-echo -e "${GREEN}Next steps:${NC}"
-echo "1. Access the web UI at http://$(hostname -I | awk '{print $1}'):8080"
-echo "2. Import your VPN configuration"
-echo "3. Click Connect and then Start VPN"
-echo "4. Check status with: sing-box-routing status"
+
+# Show routing table
+echo "Main routes:"
+ip route | head -5
 echo ""
-echo -e "${BLUE}Troubleshooting:${NC}"
-echo "- Check VPN logs: journalctl -u singbox-vpn -f"
-echo "- Check routing: sing-box-routing status"
-echo "- Test DNS: nslookup youtube.com"
-echo "- Check TUN interface: ip addr show tun0"
+
+# Show NAT rules
+echo "NAT rules:"
+iptables -t nat -L POSTROUTING -n | grep MASQUE
+echo ""
+
+# Test commands
+echo "========================================"
+echo "         TESTING COMMANDS"
+echo "========================================"
+echo ""
+echo "1. Check routing status:"
+echo "   fix-vpn-routing check"
+echo ""
+echo "2. Test connectivity:"
+echo "   fix-vpn-routing test"
+echo ""
+echo "3. Fix routing issues:"
+echo "   fix-vpn-routing fix"
+echo ""
+echo "4. Check VPN logs:"
+echo "   journalctl -u singbox-vpn -f"
+echo ""
+echo "5. Run Sing-Box manually:"
+echo "   run-sing-box /etc/singbox-vpn/config.json"
+echo ""
+echo "6. Test with direct config:"
+echo "   sing-box run -c /etc/singbox-vpn/test-direct.json"
+echo ""
+
+print_success "Complete routing fix applied!"
+echo ""
+print_warning "IMPORTANT: After importing a VPN server in the web UI:"
+echo "1. Click 'Connect' on the server"
+echo "2. Click 'Start VPN'"
+echo "3. Run: fix-vpn-routing fix"
+echo "4. Test with: fix-vpn-routing test"
