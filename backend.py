@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Sing-Box VPN Manager Backend Service - Fixed Version
-Properly handles TUN routing and traffic monitoring
+Sing-Box VPN Manager Backend - Complete No-CORS Version
+Works without flask-cors by implementing CORS manually
 """
 
 import os
@@ -19,11 +19,20 @@ from typing import Dict, List, Optional, Any
 from datetime import datetime
 from urllib.parse import urlparse, parse_qs
 
-from flask import Flask, request, jsonify, send_from_directory
-from flask_cors import CORS
+from flask import Flask, request, jsonify, send_from_directory, make_response
 
 app = Flask(__name__)
-CORS(app)
+
+# Manual CORS implementation
+def add_cors_headers(response):
+    response.headers['Access-Control-Allow-Origin'] = '*'
+    response.headers['Access-Control-Allow-Methods'] = 'GET, POST, DELETE, OPTIONS'
+    response.headers['Access-Control-Allow-Headers'] = 'Content-Type'
+    return response
+
+@app.after_request
+def after_request(response):
+    return add_cors_headers(response)
 
 # Configuration paths
 BASE_DIR = Path("/etc/singbox-vpn")
@@ -91,20 +100,13 @@ class V2RayParser:
                     "type": "grpc",
                     "service_name": config.get("path", "")
                 }
-            elif net_type == "h2":
-                outbound["transport"] = {
-                    "type": "http",
-                    "host": [config.get("host", "")],
-                    "path": config.get("path", "/")
-                }
             
             # Add TLS if enabled
             if config.get("tls") == "tls":
                 outbound["tls"] = {
                     "enabled": True,
                     "server_name": config.get("sni", config.get("host", config.get("add"))),
-                    "insecure": True,
-                    "alpn": ["h2", "http/1.1"]
+                    "insecure": True
                 }
             
             return outbound
@@ -123,9 +125,13 @@ class V2RayParser:
                 "tag": params.get("remarks", [parsed.fragment or "VLESS Server"])[0],
                 "server": parsed.hostname,
                 "server_port": parsed.port or 443,
-                "uuid": parsed.username,
-                "flow": params.get("flow", [""])[0] or ""
+                "uuid": parsed.username
             }
+            
+            # Add flow if present
+            flow = params.get("flow", [""])[0]
+            if flow:
+                outbound["flow"] = flow
             
             # Transport settings
             transport_type = params.get("type", ["tcp"])[0]
@@ -149,8 +155,7 @@ class V2RayParser:
                 outbound["tls"] = {
                     "enabled": True,
                     "server_name": params.get("sni", [parsed.hostname])[0],
-                    "insecure": True,
-                    "alpn": params.get("alpn", ["h2,http/1.1"])[0].split(",")
+                    "insecure": True
                 }
             elif security == "reality":
                 outbound["tls"] = {
@@ -192,18 +197,12 @@ class V2RayParser:
                         "Host": params.get("host", [""])[0]
                     }
                 }
-            elif transport_type == "grpc":
-                outbound["transport"] = {
-                    "type": "grpc",
-                    "service_name": params.get("serviceName", [""])[0]
-                }
             
             # TLS is always enabled for Trojan
             outbound["tls"] = {
                 "enabled": True,
                 "server_name": params.get("sni", [parsed.hostname])[0],
-                "insecure": True,
-                "alpn": ["h2", "http/1.1"]
+                "insecure": True
             }
             
             return outbound
@@ -238,13 +237,11 @@ class SingBoxManager:
                 "servers": [
                     {
                         "tag": "google",
-                        "address": "tls://8.8.8.8",
-                        "address_resolver": "local"
+                        "address": "tls://8.8.8.8"
                     },
                     {
-                        "tag": "cloudflare",
-                        "address": "https://1.1.1.1/dns-query",
-                        "address_resolver": "local"
+                        "tag": "cloudflare", 
+                        "address": "https://1.1.1.1/dns-query"
                     },
                     {
                         "tag": "local",
@@ -255,16 +252,10 @@ class SingBoxManager:
                 "rules": [
                     {
                         "outbound": "any",
-                        "server": "local"
-                    },
-                    {
-                        "geosite": ["ir", "category-ir"],
-                        "server": "local"
+                        "server": "google"
                     }
                 ],
-                "strategy": "prefer_ipv4",
-                "disable_cache": False,
-                "disable_expire": False
+                "strategy": "prefer_ipv4"
             },
             "inbounds": [
                 {
@@ -296,43 +287,18 @@ class SingBoxManager:
                 }
             ],
             "route": {
-                "geoip": {
-                    "path": "/usr/share/sing-box/geoip.db",
-                    "download_url": "https://github.com/SagerNet/sing-geoip/releases/latest/download/geoip.db"
-                },
-                "geosite": {
-                    "path": "/usr/share/sing-box/geosite.db",
-                    "download_url": "https://github.com/SagerNet/sing-geosite/releases/latest/download/geosite.db"
-                },
                 "rules": [
                     {
                         "protocol": "dns",
                         "outbound": "dns-out"
                     },
                     {
-                        "geosite": ["ir", "category-ir"],
-                        "geoip": ["ir", "private"],
-                        "outbound": "direct"
-                    },
-                    {
-                        "network": "tcp",
-                        "port": [22, 3389],
-                        "outbound": "direct"
-                    },
-                    {
-                        "ip_cidr": ["127.0.0.1/8", "::1/128"],
+                        "ip_cidr": ["127.0.0.1/8", "::1/128", "192.168.0.0/16", "10.0.0.0/8"],
                         "outbound": "direct"
                     }
                 ],
                 "final": outbound["tag"],
-                "auto_detect_interface": True,
-                "override_android_vpn": False
-            },
-            "experimental": {
-                "clash_api": {
-                    "external_controller": "127.0.0.1:9090",
-                    "store_selected": True
-                }
+                "auto_detect_interface": True
             }
         }
         
@@ -342,27 +308,11 @@ class SingBoxManager:
     def setup_routing():
         """Setup proper IP routing and firewall rules"""
         commands = [
-            # Enable IP forwarding
             ["sysctl", "-w", "net.ipv4.ip_forward=1"],
             ["sysctl", "-w", "net.ipv6.conf.all.forwarding=1"],
-            
-            # Flush existing rules
-            ["iptables", "-t", "nat", "-F"],
-            ["iptables", "-F", "FORWARD"],
-            
-            # Setup NAT for TUN interface
             ["iptables", "-t", "nat", "-A", "POSTROUTING", "-o", "tun0", "-j", "MASQUERADE"],
-            
-            # Allow forwarding
             ["iptables", "-A", "FORWARD", "-i", "tun0", "-j", "ACCEPT"],
-            ["iptables", "-A", "FORWARD", "-o", "tun0", "-j", "ACCEPT"],
-            
-            # Allow established connections
-            ["iptables", "-A", "INPUT", "-m", "state", "--state", "ESTABLISHED,RELATED", "-j", "ACCEPT"],
-            ["iptables", "-A", "OUTPUT", "-m", "state", "--state", "ESTABLISHED", "-j", "ACCEPT"],
-            
-            # Fix MTU issues
-            ["iptables", "-t", "mangle", "-A", "FORWARD", "-p", "tcp", "--tcp-flags", "SYN,RST", "SYN", "-j", "TCPMSS", "--clamp-mss-to-pmtu"]
+            ["iptables", "-A", "FORWARD", "-o", "tun0", "-j", "ACCEPT"]
         ]
         
         for cmd in commands:
@@ -370,29 +320,6 @@ class SingBoxManager:
                 subprocess.run(cmd, check=False, capture_output=True)
             except Exception as e:
                 log_message(f"Failed to execute {' '.join(cmd)}: {e}", "warning")
-    
-    @staticmethod
-    def download_geo_data():
-        """Download geoip and geosite databases"""
-        geo_dir = Path("/usr/share/sing-box")
-        geo_dir.mkdir(parents=True, exist_ok=True)
-        
-        databases = [
-            ("https://github.com/SagerNet/sing-geoip/releases/latest/download/geoip.db", geo_dir / "geoip.db"),
-            ("https://github.com/SagerNet/sing-geosite/releases/latest/download/geosite.db", geo_dir / "geosite.db")
-        ]
-        
-        for url, path in databases:
-            if not path.exists():
-                try:
-                    log_message(f"Downloading {path.name}...")
-                    response = requests.get(url, stream=True)
-                    with open(path, 'wb') as f:
-                        for chunk in response.iter_content(chunk_size=8192):
-                            f.write(chunk)
-                    log_message(f"{path.name} downloaded successfully")
-                except Exception as e:
-                    log_message(f"Failed to download {path.name}: {e}", "warning")
     
     @staticmethod
     def start():
@@ -405,9 +332,6 @@ class SingBoxManager:
             
             # Setup routing
             SingBoxManager.setup_routing()
-            
-            # Download geo data if needed
-            SingBoxManager.download_geo_data()
             
             # Start Sing-Box process directly
             cmd = ["/usr/local/bin/sing-box", "run", "-c", str(SINGBOX_CONFIG)]
@@ -436,7 +360,7 @@ class SingBoxManager:
                 log_message("Sing-Box started successfully")
                 return True
             else:
-                stderr = singbox_process.stderr.read()
+                stderr = singbox_process.stderr.read() if singbox_process.stderr else ""
                 log_message(f"Sing-Box failed to start: {stderr}", "error")
                 return False
                 
@@ -461,7 +385,6 @@ class SingBoxManager:
                 try:
                     os.kill(pid, signal.SIGTERM)
                     time.sleep(1)
-                    os.kill(pid, signal.SIGKILL)
                 except ProcessLookupError:
                     pass
                 PID_FILE.unlink()
@@ -470,15 +393,12 @@ class SingBoxManager:
             if singbox_process:
                 singbox_process.terminate()
                 time.sleep(1)
-                singbox_process.kill()
+                if singbox_process.poll() is None:
+                    singbox_process.kill()
                 singbox_process = None
             
             # Kill any remaining sing-box processes
             subprocess.run(["pkill", "-f", "sing-box"], check=False)
-            
-            # Clean up routing
-            subprocess.run(["iptables", "-t", "nat", "-F"], check=False)
-            subprocess.run(["iptables", "-F", "FORWARD"], check=False)
             
             vpn_status["connected"] = False
             vpn_status["server"] = None
@@ -498,7 +418,7 @@ def monitor_traffic():
     while traffic_monitor_thread:
         try:
             # Check multiple possible interface names
-            interfaces = ["tun0", "singbox0", "utun", "tun"]
+            interfaces = ["tun0", "singbox0", "utun"]
             stats = None
             
             for iface in interfaces:
@@ -527,28 +447,8 @@ def monitor_traffic():
                         "bytes_sent": stats.bytes_sent,
                         "time": current_time
                     }
-            else:
-                # If no TUN interface found, try to get total system traffic
-                stats = psutil.net_io_counters()
-                if stats:
-                    current_time = time.time()
-                    time_diff = current_time - last_traffic_stats["time"]
-                    
-                    if time_diff > 0 and vpn_status["connected"]:
-                        download_speed = (stats.bytes_recv - last_traffic_stats["bytes_recv"]) / time_diff
-                        upload_speed = (stats.bytes_sent - last_traffic_stats["bytes_sent"]) / time_diff
-                        
-                        vpn_status["download_speed"] = max(0, int(download_speed))
-                        vpn_status["upload_speed"] = max(0, int(upload_speed))
-                        vpn_status["total_traffic"] = stats.bytes_recv + stats.bytes_sent
-                        
-                        last_traffic_stats = {
-                            "bytes_recv": stats.bytes_recv,
-                            "bytes_sent": stats.bytes_sent,
-                            "time": current_time
-                        }
         except Exception as e:
-            log_message(f"Traffic monitor error: {e}", "debug")
+            pass
         
         time.sleep(1)
 
@@ -570,11 +470,9 @@ def log_message(message: str, level: str = "info"):
     }
     logs.append(entry)
     
-    # Keep only last 100 logs
     if len(logs) > 100:
         logs = logs[-100:]
     
-    # Also write to file
     try:
         with open(LOG_FILE, "a") as f:
             f.write(f"{entry['time']} [{level.upper()}] {message}\n")
@@ -633,7 +531,6 @@ def import_subscription(url: str) -> List[Dict]:
 def test_server_connection(server: Dict) -> Dict:
     """Test server connection"""
     try:
-        # Simple TCP connection test
         import socket
         start_time = time.time()
         
@@ -792,7 +689,18 @@ def connect_server(server_id):
 def start_vpn():
     """Start VPN"""
     if not current_config:
-        return jsonify({"success": False, "error": "No server selected"}), 400
+        # Try to use the active server from database
+        active_server = next((s for s in servers_db if s.get("active")), None)
+        if not active_server:
+            return jsonify({"success": False, "error": "No server selected"}), 400
+        
+        # Generate config for active server
+        config = SingBoxManager.generate_config(active_server["config"])
+        with open(SINGBOX_CONFIG, "w") as f:
+            json.dump(config, f, indent=2)
+        
+        current_config = active_server["id"]
+        vpn_status["server"] = active_server["name"]
     
     if SingBoxManager.start():
         log_message("VPN started")
@@ -815,9 +723,15 @@ def get_status():
         "logs": logs[-20:]  # Last 20 logs
     })
 
+# Handle OPTIONS requests for CORS
+@app.route('/api/<path:path>', methods=['OPTIONS'])
+def handle_api_options(path):
+    response = make_response()
+    return add_cors_headers(response)
+
 if __name__ == '__main__':
     load_servers()
-    log_message("Sing-Box VPN Manager started")
+    log_message("Sing-Box VPN Manager started (No-CORS version)")
     
     # Check for running VPN on startup
     if PID_FILE.exists():
@@ -828,6 +742,7 @@ if __name__ == '__main__':
             os.kill(pid, 0)
             vpn_status["connected"] = True
             start_traffic_monitor()
+            log_message("Found existing VPN connection")
         except:
             PID_FILE.unlink()
     
