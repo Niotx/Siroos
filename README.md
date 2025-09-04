@@ -30,7 +30,7 @@ A production-ready, headless V2Ray VPN client system for Debian-based Linux devi
 ### One-Line Installation
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Siroos/singbox-vpn/main/install.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/Niotx/Siroos/main/install.sh | sudo bash
 ```
 
 Or download and run manually:
