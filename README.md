@@ -36,7 +36,7 @@ curl -fsSL https://raw.githubusercontent.com/Siroos/singbox-vpn/main/install.sh 
 Or download and run manually:
 
 ```bash
-wget https://raw.githubusercontent.com/your-repo/singbox-vpn/main/install.sh
+wget https://raw.githubusercontent.com/Siroos/singbox-vpn/main/install.sh
 chmod +x install.sh
 sudo ./install.sh
 ```
@@ -45,7 +45,7 @@ sudo ./install.sh
 
 1. **Clone the repository:**
 ```bash
-git clone https://github.com/your-repo/singbox-vpn.git
+git clone https://github.com/Siroos/singbox-vpn.git
 cd singbox-vpn
 ```
 
